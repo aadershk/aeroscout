@@ -1,62 +1,53 @@
-"""Tests for core/dedup.py."""
-import pytest
-from core.dedup import dedup
+"""Tests for core.dedup."""
+from core.dedup import dedup, _clean_url
 from core.models import Job
 
 
-def make_job(title: str, company: str, url: str) -> Job:
-    return Job(title=title, company=company, location="Amsterdam", url=url)
+class TestCleanUrl:
+    def test_strip_utm(self):
+        url = "https://example.com/job?utm_source=google&id=123"
+        assert _clean_url(url) == "https://example.com/job?id=123"
+
+    def test_strip_gclid(self):
+        url = "https://example.com/job?gclid=abc123"
+        assert _clean_url(url) == "https://example.com/job"
+
+    def test_strip_fbclid(self):
+        url = "https://example.com/job?fbclid=abc"
+        assert _clean_url(url) == "https://example.com/job"
+
+    def test_trailing_slash(self):
+        assert _clean_url("https://example.com/job/") == "https://example.com/job"
+
+    def test_lowercase(self):
+        assert _clean_url("HTTPS://EXAMPLE.COM/Job") == "https://example.com/job"
 
 
 class TestDedup:
-    def test_exact_url_dedup(self):
-        jobs = [
-            make_job("Data Analyst", "KLM", "https://klm.com/job/123"),
-            make_job("Data Analyst", "KLM", "https://klm.com/job/123"),
-        ]
-        result = dedup(jobs)
-        assert len(result) == 1
+    def test_url_dedup(self):
+        j1 = Job("Data Analyst", "Co A", "NL", "https://example.com/job/1")
+        j2 = Job("Data Analyst", "Co A", "NL", "https://example.com/job/1")
+        assert len(dedup([j1, j2])) == 1
 
-    def test_url_trailing_slash_dedup(self):
-        jobs = [
-            make_job("Data Analyst", "KLM", "https://klm.com/job/123"),
-            make_job("Data Analyst", "KLM", "https://klm.com/job/123/"),
-        ]
-        result = dedup(jobs)
-        assert len(result) == 1
+    def test_url_dedup_tracking(self):
+        j1 = Job("Data Analyst", "Co A", "NL", "https://example.com/job/1")
+        j2 = Job("Data Analyst", "Co A", "NL", "https://example.com/job/1?utm_source=google")
+        assert len(dedup([j1, j2])) == 1
 
-    def test_uid_semantic_dedup(self):
-        # Same title+company, different URLs → same uid → deduplicated
-        jobs = [
-            make_job("Revenue Management Analyst", "Amadeus", "https://amadeus.com/job/1"),
-            make_job("Revenue Management Analyst", "Amadeus", "https://amadeus.com/job/2"),
-        ]
-        result = dedup(jobs)
-        assert len(result) == 1
+    def test_uid_dedup(self):
+        j1 = Job("Data Analyst", "Co A", "NL", "https://a.com/1")
+        j2 = Job("Data Analyst", "Co A", "NL", "https://b.com/2")
+        # Same title+company → same uid
+        assert j1.uid == j2.uid
+        assert len(dedup([j1, j2])) == 1
 
-    def test_different_companies_not_deduped(self):
-        jobs = [
-            make_job("Data Scientist", "KLM", "https://klm.com/job/1"),
-            make_job("Data Scientist", "Amadeus", "https://amadeus.com/job/1"),
-        ]
-        result = dedup(jobs)
-        assert len(result) == 2
+    def test_different_jobs_kept(self):
+        j1 = Job("Data Analyst", "Co A", "NL", "https://a.com/1")
+        j2 = Job("Data Scientist", "Co B", "NL", "https://b.com/2")
+        assert len(dedup([j1, j2])) == 2
 
-    def test_empty_list(self):
-        assert dedup([]) == []
-
-    def test_preserves_first_occurrence(self):
-        jobs = [
-            make_job("Data Analyst", "KLM", "https://klm.com/job/1"),
-            make_job("Data Analyst", "KLM", "https://klm.com/job/2"),
-        ]
-        result = dedup(jobs)
-        assert result[0].url == "https://klm.com/job/1"
-
-    def test_url_case_insensitive(self):
-        jobs = [
-            make_job("Data Analyst", "KLM", "https://KLM.com/job/123"),
-            make_job("Data Analyst", "KLM", "https://klm.com/job/123"),
-        ]
-        result = dedup(jobs)
-        assert len(result) == 1
+    def test_keeps_first(self):
+        j1 = Job("Data Analyst", "Co A", "NL", "https://a.com/1", source="first")
+        j2 = Job("Data Analyst", "Co A", "NL", "https://b.com/2", source="second")
+        result = dedup([j1, j2])
+        assert result[0].source == "first"

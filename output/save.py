@@ -1,4 +1,4 @@
-"""Timestamped .txt output file writer."""
+"""Save results to text file."""
 from __future__ import annotations
 
 import os
@@ -8,45 +8,30 @@ from pathlib import Path
 from core.models import Job
 
 
-def save_results(
-    jobs: list[Job],
-    min_score: int = 40,
-    output_dir: str | Path = ".",
-) -> Path:
-    """Write qualifying jobs to a timestamped .txt file. Returns the path."""
-    qualifying = [j for j in jobs if j.score >= min_score]
-    qualifying.sort(key=lambda j: j.score, reverse=True)
-
+def save_results(jobs: list[Job], output_dir: str = ".") -> str:
+    """Save jobs to aeroscout_YYYYMMDD_HHMMSS.txt. Returns the file path."""
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    out_path = output_dir / f"aeroscout_{ts}.txt"
+    out_path = Path(output_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    filepath = out_path / f"aeroscout_{ts}.txt"
 
-    lines = [
-        f"AeroScout — Run {ts}",
-        f"Qualifying jobs (score >= {min_score}): {len(qualifying)}",
-        "=" * 70,
-        "",
-    ]
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(f"AeroScout Results — {datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
+        f.write(f"Total qualifying jobs: {len(jobs)}\n")
+        f.write("=" * 80 + "\n\n")
 
-    for i, job in enumerate(qualifying, 1):
-        lines += [
-            f"[{i}] Score: {job.score}",
-            f"    Title:    {job.title}",
-            f"    Company:  {job.company}",
-            f"    Location: {job.location or '—'}",
-            f"    Source:   {job.source}",
-            f"    URL:      {job.url}",
-            "",
-        ]
+        for i, job in enumerate(jobs, 1):
+            f.write(f"#{i}  Score: {job.score}  Seniority: {job.seniority}\n")
+            f.write(f"Title:    {job.title}\n")
+            f.write(f"Company:  {job.company}\n")
+            f.write(f"Location: {job.location}\n")
+            f.write(f"Source:   {job.source}\n")
+            f.write(f"URL:      {job.url}\n")
+            if job.score_detail:
+                parts = ", ".join(f"{k}={v:+d}" for k, v in job.score_detail.items())
+                f.write(f"Scoring:  {parts}\n")
+            if job.description:
+                f.write(f"Description: {job.description[:300]}\n")
+            f.write("-" * 80 + "\n\n")
 
-    lines += [
-        "=" * 70,
-        "URLs only:",
-        "",
-    ]
-    for i, job in enumerate(qualifying, 1):
-        lines.append(f"[{i}] {job.url}")
-
-    out_path.write_text("\n".join(lines), encoding="utf-8")
-    return out_path
+    return str(filepath)

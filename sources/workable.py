@@ -1,108 +1,73 @@
-"""Workable ATS source.
-
-Endpoint: POST https://apply.workable.com/api/v3/accounts/{slug}/jobs
-Body: {"query":"","location":"","limit":100}
-"""
+"""Workable fetcher."""
 from __future__ import annotations
 
 import asyncio
 import logging
 
-import aiohttp
-
+from core.gate import passes_gate
 from core.models import Job
 from core.normalise import _norm, _valid_url
-from sources._http import HEADERS_JSON, TASK_TIMEOUT, _SSL, get_semaphore, make_timeout
+from sources._http import HEADERS_JSON, get_sem, safe_get, safe_post
 
 log = logging.getLogger(__name__)
 
-# Unverified slugs — need runtime testing to confirm
 TARGETS = [
-    ("navblue",             "NAVBLUE"),
-    ("arcadis",             "Arcadis"),
-    ("mottmacdonaldgroup",  "Mott MacDonald"),
-    ("jacobs",              "Jacobs"),
-    ("rolandberger",        "Roland Berger"),
-    ("portofrotterdam",     "Port of Rotterdam"),
-    ("goudappel",           "Goudappel"),
-    ("steer",               "Steer"),
+    ("eurocontrol", "Eurocontrol"), ("navblue", "NAVBLUE"),
+    ("sabre", "Sabre"), ("arcadis", "Arcadis"),
+    ("mottmacdonaldgroup", "Mott MacDonald"), ("jacobs", "Jacobs"),
+    ("rolandberger", "Roland Berger"),
+    ("portofrotterdam", "Port of Rotterdam"),
+    ("goudappel", "Goudappel"), ("steer", "Steer"), ("wsp", "WSP"),
 ]
 
-BASE = "https://apply.workable.com/api/v3/accounts"
-HOST = "apply.workable.com"
 
+async def _fetch_slug(session, slug: str, company: str) -> list[Job]:
+    sem = get_sem("apply.workable.com")
+    url = f"https://apply.workable.com/api/v3/accounts/{slug}/jobs"
+    payload = {"limit": 100, "offset": 0}
 
-async def _fetch_slug(
-    session: aiohttp.ClientSession,
-    slug: str,
-    company: str,
-) -> list[Job]:
-    url = f"{BASE}/{slug}/jobs"
-    sem = get_semaphore(HOST)
+    # Try POST first
+    status, data = await safe_post(session, url, sem, payload, HEADERS_JSON)
+    if status != 200 or not isinstance(data, dict):
+        # Fallback to GET
+        status, data = await safe_get(session, url, sem, headers=HEADERS_JSON)
+    if status != 200 or not isinstance(data, dict):
+        log.debug("Workable %s: status=%s", slug, status)
+        return []
 
-    payload = {"query": "", "location": "", "limit": 100}
+    jobs: list[Job] = []
+    for j in data.get("results", []):
+        title = j.get("title", "")
+        loc = j.get("location", {})
+        if isinstance(loc, dict):
+            loc = loc.get("city", "") + ", " + loc.get("country", "")
+        elif not isinstance(loc, str):
+            loc = ""
+        shortcode = j.get("shortcode", "")
+        job_url = f"https://apply.workable.com/{slug}/j/{shortcode}/" if shortcode else ""
 
-    async with sem:
-        try:
-            async with session.post(
-                url,
-                json=payload,
-                headers=HEADERS_JSON,
-                ssl=_SSL,
-                timeout=make_timeout(),
-            ) as resp:
-                if resp.status in (400, 404):
-                    log.debug("Workable '%s' → HTTP %s (slug not found)", slug, resp.status)
-                    return []
-                if resp.status != 200:
-                    log.warning("Workable '%s' → HTTP %s", slug, resp.status)
-                    return []
-                data = await resp.json(content_type=None)
-        except Exception as exc:
-            log.warning("Workable '%s' error: %s", slug, exc)
-            return []
-
-    jobs = []
-    for item in data.get("results", []):
-        title = _norm(item.get("title", ""))
-        if not title:
-            continue
-
-        shortcode = item.get("shortcode", "")
-        job_url = f"https://apply.workable.com/{slug}/j/{shortcode}/"
         if not _valid_url(job_url):
             continue
 
-        location = item.get("city", "") or ""
-        country = item.get("country", "") or ""
-        if country:
-            location = f"{location}, {country}".strip(", ")
+        ok, _ = passes_gate(_norm(title), company=company)
+        if not ok:
+            continue
 
         jobs.append(Job(
-            title=title,
-            company=company,
-            location=location,
-            url=job_url,
-            source="workable",
+            title=title, company=company, location=loc,
+            url=job_url, source="workable",
         ))
 
-    log.debug("Workable '%s': %d jobs", slug, len(jobs))
     return jobs
 
 
-async def fetch_workable(session: aiohttp.ClientSession) -> list[Job]:
-    tasks = [
-        asyncio.wait_for(_fetch_slug(session, slug, company), timeout=TASK_TIMEOUT)
-        for slug, company in TARGETS
-    ]
+async def fetch_workable(session) -> list[Job]:
+    tasks = [_fetch_slug(session, s, c) for s, c in TARGETS]
     results = await asyncio.gather(*tasks, return_exceptions=True)
-
     jobs: list[Job] = []
     for r in results:
-        if isinstance(r, BaseException):
-            log.warning("Workable task exception: %s", r)
-            continue
-        jobs.extend(r)
-
-    log.debug("Workable total: %d jobs", len(jobs))
+        if isinstance(r, list):
+            jobs.extend(r)
+        elif isinstance(r, Exception):
+            log.warning("Workable error: %s", r)
     return jobs

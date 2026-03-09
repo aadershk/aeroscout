@@ -1,4 +1,4 @@
-"""Utility helpers used across all modules."""
+"""Title normalisation and utility helpers."""
 from __future__ import annotations
 
 import random
@@ -6,40 +6,54 @@ import re
 from urllib.parse import urlparse
 
 
-# Strip leading ATS job codes like "REQ-1234: " or "(NL) " etc.
-_CODE_PREFIX = re.compile(r"^[\[\(][^\]\)]{1,20}[\]\)]\s*")
-_ATS_ID = re.compile(r"^\w{2,8}-\d{3,}\s*[:\-–]\s*")
-_HTML_TAGS = re.compile(r"<[^>]+>")
-_MULTI_SPACE = re.compile(r"\s+")
-
-
 def _norm(title: str) -> str:
-    """Normalise a job title: strip HTML, remove ATS prefixes, collapse whitespace."""
-    t = _HTML_TAGS.sub(" ", title)
-    t = _CODE_PREFIX.sub("", t)
-    t = _ATS_ID.sub("", t)
-    t = _MULTI_SPACE.sub(" ", t).strip()
+    """Normalise a job title: strip HTML, ATS codes, brackets, CamelCase split, collapse ws."""
+    t = title
+    # 1. Strip HTML tags
+    t = re.sub(r'<[^>]+>', ' ', t)
+    # 2. Strip ATS codes
+    t = re.sub(r'^[A-Z]\d{4,9}-\d{3}\s+', '', t)
+    t = re.sub(r'^\w{2,8}-\d{3,}\s*[:\-\u2013]\s*', '', t)
+    # 3. Strip bracket prefix
+    t = re.sub(r'^[\[\(][^\]\)]{1,25}[\]\)]\s*', '', t)
+    # 4. CamelCase split
+    t = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', t)
+    t = re.sub(r'(?<=[A-Z]{2})(?=[A-Z][a-z])', ' ', t)
+    # 5. Collapse whitespace
+    t = re.sub(r'\s+', ' ', t).strip()
     return t
 
 
 def _valid_url(url: str) -> bool:
-    """Return True only if url is http/https with a real host."""
-    if not url:
+    """Return True only for http/https URLs with a netloc, not javascript: or #."""
+    if not url or url.startswith('javascript:') or url.strip() == '#':
         return False
     try:
         p = urlparse(url)
-        return p.scheme in ("http", "https") and bool(p.netloc)
+        return p.scheme in ('http', 'https') and bool(p.netloc)
     except Exception:
         return False
 
 
-def _parse_ct(headers: dict) -> str:
-    """Extract bare MIME type from Content-Type header."""
-    ct = headers.get("Content-Type", headers.get("content-type", ""))
-    return ct.split(";")[0].strip().lower()
+_NL_PAT = re.compile(
+    r'netherlands|nederland|amsterdam|schiphol|hoofddorp|eindhoven|rotterdam'
+    r'|den haag|the hague|utrecht|rijswijk|amstelveen|haarlemmermeer'
+    r'|north holland|noord-holland|\bnl\b',
+    re.I,
+)
+
+
+def _is_nl(text: str) -> bool:
+    """Return True if text mentions a Dutch location."""
+    return bool(_NL_PAT.search(text))
 
 
 def _jitter(attempt: int) -> float:
-    """Exponential backoff with jitter: 1-2s, 2-4s, 4-8s..."""
-    base = 2 ** attempt
-    return base + random.uniform(0, base)
+    """Exponential jitter for retries."""
+    return random.uniform(0, min(2 ** attempt, 30))
+
+
+def _parse_ct(headers: dict) -> str:
+    """Extract bare MIME type from Content-Type header, stripping charset etc."""
+    ct = headers.get('Content-Type', headers.get('content-type', ''))
+    return ct.split(';')[0].strip().lower()

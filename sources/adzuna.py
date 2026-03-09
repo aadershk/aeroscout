@@ -1,121 +1,113 @@
-"""Adzuna NL source.
-
-Requires API key registration at developer.adzuna.com (free tier).
-Set environment variables: ADZUNA_APP_ID and ADZUNA_APP_KEY.
-
-Endpoint: GET https://api.adzuna.com/v1/api/jobs/nl/search/{page}
-Params: app_id, app_key, results_per_page=50, what=...
-"""
+"""Adzuna NL fetcher."""
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-import os
 
-import aiohttp
+from bs4 import BeautifulSoup
 
+from core.gate import passes_gate
 from core.models import Job
 from core.normalise import _norm, _valid_url
-from sources._http import HEADERS_JSON, TASK_TIMEOUT, _SSL, get_semaphore, make_timeout
+from sources._http import HEADERS_HTML, get_sem, safe_get
 
 log = logging.getLogger(__name__)
 
-BASE = "https://api.adzuna.com/v1/api/jobs/nl/search"
-HOST = "api.adzuna.com"
-
-SEARCH_TERMS = [
-    "data analyst",
-    "data scientist",
-    "revenue management",
-    "operations research",
+QUERIES = [
+    "revenue management analyst", "yield analyst", "operations research analyst",
+    "aviation data scientist", "pricing analyst", "quantitative analyst",
+    "demand forecasting analyst", "business analyst aviation", "data analyst schiphol",
+    "junior data analyst", "supply chain data scientist", "transport analytics",
 ]
 
 
-async def _fetch_page(
-    session: aiohttp.ClientSession,
-    app_id: str,
-    app_key: str,
-    what: str,
-    page: int = 1,
-) -> list[Job]:
-    url = f"{BASE}/{page}"
-    params = {
-        "app_id": app_id,
-        "app_key": app_key,
-        "results_per_page": 50,
-        "what": what,
-        "content-type": "application/json",
-    }
-    sem = get_semaphore(HOST)
-
-    async with sem:
-        try:
-            async with session.get(
-                url,
-                params=params,
-                headers=HEADERS_JSON,
-                ssl=_SSL,
-                timeout=make_timeout(),
-            ) as resp:
-                if resp.status == 401:
-                    log.warning("Adzuna: invalid API credentials")
-                    return []
-                if resp.status != 200:
-                    log.warning("Adzuna '%s' p%s → HTTP %s", what, page, resp.status)
-                    return []
-                data = await resp.json(content_type=None)
-        except Exception as exc:
-            log.warning("Adzuna '%s' error: %s", what, exc)
-            return []
-
-    jobs = []
-    for item in data.get("results", []):
-        title = _norm(item.get("title", ""))
-        if not title:
-            continue
-        job_url = item.get("redirect_url", "")
-        if not _valid_url(job_url):
-            continue
-
-        company = item.get("company", {}).get("display_name", "") or ""
-        location = item.get("location", {}).get("display_name", "") or ""
-        description = item.get("description", "") or ""
-
-        jobs.append(Job(
-            title=title,
-            company=company,
-            location=location,
-            url=job_url,
-            description=description[:3000],
-            source="adzuna",
-        ))
-
-    return jobs
-
-
-async def fetch_adzuna(session: aiohttp.ClientSession) -> list[Job]:
-    app_id = os.environ.get("ADZUNA_APP_ID", "")
-    app_key = os.environ.get("ADZUNA_APP_KEY", "")
-
-    if not app_id or not app_key:
-        log.debug("Adzuna skipped — ADZUNA_APP_ID / ADZUNA_APP_KEY not set")
-        return []
-
-    tasks = [
-        asyncio.wait_for(
-            _fetch_page(session, app_id, app_key, what=term),
-            timeout=TASK_TIMEOUT,
-        )
-        for term in SEARCH_TERMS
-    ]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
+async def fetch_adzuna(session) -> list[Job]:
+    sem = get_sem("www.adzuna.nl")
     jobs: list[Job] = []
-    for r in results:
-        if isinstance(r, BaseException):
-            log.warning("Adzuna task exception: %s", r)
-            continue
-        jobs.extend(r)
+    seen_urls: set[str] = set()
 
-    log.debug("Adzuna total: %d jobs", len(jobs))
+    for q in QUERIES:
+        url = "https://www.adzuna.nl/search"
+        params = {"q": q, "results_per_page": "20", "sort_by": "date"}
+        status, text = await safe_get(session, url, sem, params=params, headers=HEADERS_HTML)
+
+        if status != 200 or not text or not isinstance(text, str):
+            log.debug("Adzuna q=%s: status=%s", q, status)
+            continue
+
+        soup = BeautifulSoup(text, "lxml")
+
+        # Try JSON-LD first
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                ld = json.loads(script.string or "")
+                items = ld if isinstance(ld, list) else ld.get("itemListElement", [ld])
+                for item in items:
+                    posting = item.get("item", item) if isinstance(item, dict) else item
+                    if not isinstance(posting, dict):
+                        continue
+                    if posting.get("@type") not in ("JobPosting", "jobPosting", None):
+                        continue
+
+                    title = posting.get("title", "")
+                    company = ""
+                    ho = posting.get("hiringOrganization", {})
+                    if isinstance(ho, dict):
+                        company = ho.get("name", "")
+                    loc_obj = posting.get("jobLocation", {})
+                    loc = ""
+                    if isinstance(loc_obj, dict):
+                        addr = loc_obj.get("address", {})
+                        if isinstance(addr, dict):
+                            loc = addr.get("addressLocality", "")
+                    elif isinstance(loc_obj, list) and loc_obj:
+                        addr = loc_obj[0].get("address", {})
+                        if isinstance(addr, dict):
+                            loc = addr.get("addressLocality", "")
+                    job_url = posting.get("url", "")
+
+                    if not title or not _valid_url(job_url) or job_url in seen_urls:
+                        continue
+                    seen_urls.add(job_url)
+
+                    ok, _ = passes_gate(_norm(title), company=company)
+                    if not ok:
+                        continue
+
+                    jobs.append(Job(
+                        title=title, company=company, location=loc,
+                        url=job_url, source="adzuna",
+                    ))
+            except (json.JSONDecodeError, AttributeError):
+                continue
+
+        # Fallback: parse article cards
+        for card in soup.select("article[data-aid]"):
+            title_el = card.select_one("h2 a, .title a")
+            if not title_el:
+                continue
+            title = title_el.get_text(strip=True)
+            job_url = title_el.get("href", "")
+            if job_url and not job_url.startswith("http"):
+                job_url = "https://www.adzuna.nl" + job_url
+
+            company_el = card.select_one(".company, [data-company]")
+            company = company_el.get_text(strip=True) if company_el else ""
+            loc_el = card.select_one(".location, [data-location]")
+            loc = loc_el.get_text(strip=True) if loc_el else ""
+
+            if not _valid_url(job_url) or job_url in seen_urls:
+                continue
+            seen_urls.add(job_url)
+
+            ok, _ = passes_gate(_norm(title), company=company)
+            if not ok:
+                continue
+
+            jobs.append(Job(
+                title=title, company=company, location=loc,
+                url=job_url, source="adzuna",
+            ))
+
     return jobs

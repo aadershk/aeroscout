@@ -1,63 +1,83 @@
-"""Tests for core/normalise.py."""
-import pytest
-from core.normalise import _norm, _valid_url, _parse_ct
+"""Tests for core.normalise."""
+from core.normalise import _norm, _valid_url, _is_nl, _parse_ct
 
 
 class TestNorm:
-    def test_strips_html_tags(self):
-        assert _norm("<b>Data Analyst</b>") == "Data Analyst"
+    def test_camelcase(self):
+        assert _norm("SeniorDataEngineer") == "Senior Data Engineer"
 
-    def test_strips_ats_code_prefix(self):
-        # REQ-1234: prefix
-        assert _norm("REQ-1234: Revenue Management Analyst") == "Revenue Management Analyst"
+    def test_ats_code(self):
+        assert _norm("I261217-002 SeniorDataEngineer") == "Senior Data Engineer"
 
-    def test_strips_bracket_prefix(self):
-        assert _norm("[NL] Data Scientist") == "Data Scientist"
+    def test_bracket_prefix(self):
+        assert _norm("[NL] Data Analyst") == "Data Analyst"
 
-    def test_strips_paren_prefix(self):
-        assert _norm("(AMS) Yield Analyst") == "Yield Analyst"
+    def test_paren_prefix(self):
+        assert _norm("(Remote) ML Engineer") == "ML Engineer"
 
-    def test_collapses_whitespace(self):
-        assert _norm("Data   Scientist  ") == "Data Scientist"
+    def test_html(self):
+        assert _norm("<b>Data</b> Analyst") == "Data Analyst"
 
-    def test_passthrough_clean_title(self):
-        assert _norm("Operations Research Analyst") == "Operations Research Analyst"
+    def test_ats_code_dash(self):
+        assert _norm("REQ-1234: Data Scientist") == "Data Scientist"
 
-    def test_empty_string(self):
-        assert _norm("") == ""
+    def test_collapse_whitespace(self):
+        assert _norm("Data   Analyst   Role") == "Data Analyst Role"
 
-    def test_html_entities_not_mangled(self):
-        # We strip tags, not entities; &amp; stays (handled by BS4 upstream)
-        result = _norm("Data &amp; Analytics")
-        assert "Data" in result
+    def test_plain(self):
+        assert _norm("Revenue Management Analyst") == "Revenue Management Analyst"
+
+    def test_uppercase_split(self):
+        # ABCDefg -> ABC Defg
+        assert _norm("ABCDefg") == "ABC Defg"
 
 
 class TestValidUrl:
     def test_valid_https(self):
-        assert _valid_url("https://example.com/jobs/123") is True
+        assert _valid_url("https://example.com/job/123") is True
 
     def test_valid_http(self):
-        assert _valid_url("http://careers.company.com") is True
+        assert _valid_url("http://example.com") is True
 
-    def test_empty_string(self):
+    def test_javascript(self):
+        assert _valid_url("javascript:void(0)") is False
+
+    def test_hash(self):
+        assert _valid_url("#") is False
+
+    def test_empty(self):
         assert _valid_url("") is False
 
     def test_no_scheme(self):
-        assert _valid_url("example.com/jobs") is False
+        assert _valid_url("example.com/job") is False
 
-    def test_ftp_rejected(self):
-        assert _valid_url("ftp://example.com") is False
 
-    def test_none_like_empty(self):
-        assert _valid_url("") is False
+class TestIsNl:
+    def test_netherlands(self):
+        assert _is_nl("Amsterdam, Netherlands") is True
+
+    def test_schiphol(self):
+        assert _is_nl("Schiphol") is True
+
+    def test_nl_code(self):
+        assert _is_nl("Location: NL") is True
+
+    def test_foreign(self):
+        assert _is_nl("London, UK") is False
+
+    def test_utrecht(self):
+        assert _is_nl("Utrecht") is True
+
+    def test_noord_holland(self):
+        assert _is_nl("Noord-Holland") is True
 
 
 class TestParseCt:
+    def test_with_charset(self):
+        assert _parse_ct({"Content-Type": "text/html; charset=utf-8"}) == "text/html"
+
     def test_json(self):
-        assert _parse_ct({"Content-Type": "application/json; charset=utf-8"}) == "application/json"
+        assert _parse_ct({"Content-Type": "application/json"}) == "application/json"
 
-    def test_html(self):
-        assert _parse_ct({"content-type": "text/html"}) == "text/html"
-
-    def test_missing(self):
+    def test_empty(self):
         assert _parse_ct({}) == ""

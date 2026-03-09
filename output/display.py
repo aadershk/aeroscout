@@ -1,96 +1,69 @@
-"""Rich terminal display for AeroScout results."""
+"""Rich console display for job results."""
 from __future__ import annotations
 
-from rich import print as rprint
+from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
-from rich.console import Console
-from rich.text import Text
 
 from core.models import Job
 
-console = Console(force_terminal=True, highlight=False)
+console = Console()
 
 
-def _tier_colour(score: int) -> str:
-    if score >= 90:
-        return "bold green"
-    if score >= 65:
-        return "green"
-    if score >= 45:
-        return "yellow"
-    return "dim"
-
-
-def render_table(jobs: list[Job], min_score: int = 40) -> None:
-    """Print sorted job table to terminal."""
-    qualifying = [j for j in jobs if j.score >= min_score]
-    qualifying.sort(key=lambda j: j.score, reverse=True)
-
-    if not qualifying:
-        rprint(f"[yellow]No jobs scored >= {min_score}[/yellow]")
+def display_results(jobs: list[Job]) -> None:
+    """Display jobs in a Rich table with score breakdown."""
+    if not jobs:
+        console.print("[bold red]No qualifying jobs found.[/bold red]")
         return
 
-    table = Table(
-        title=f"AeroScout — {len(qualifying)} qualifying roles (score >= {min_score})",
-        show_lines=False,
-        expand=True,
-    )
-    table.add_column("#", style="dim", width=3, no_wrap=True)
-    table.add_column("Score", width=6, no_wrap=True)
-    table.add_column("Title", min_width=28)
-    table.add_column("Company", min_width=18)
-    table.add_column("Location", min_width=14)
-    table.add_column("Source", width=14, no_wrap=True)
+    width = console.width or 120
 
-    for i, job in enumerate(qualifying, 1):
-        colour = _tier_colour(job.score)
+    # Main table
+    table = Table(show_header=True, header_style="bold", expand=True)
+    table.add_column("#", style="dim", width=4)
+    table.add_column("Score", width=6)
+    table.add_column("Seniority", width=10)
+    table.add_column("Title", min_width=25)
+    table.add_column("Company", min_width=15)
+    table.add_column("Location", min_width=12)
+
+    for i, job in enumerate(jobs, 1):
+        # Score color
+        if job.score > 75:
+            score_str = f"[bright_green]{job.score}[/bright_green]"
+        elif job.score >= 50:
+            score_str = f"[yellow]{job.score}[/yellow]"
+        else:
+            score_str = f"[white]{job.score}[/white]"
+
+        # Seniority color
+        sen = job.seniority
+        if sen == "Junior":
+            sen_str = f"[cyan]{sen}[/cyan]"
+        elif sen == "Senior":
+            sen_str = f"[red]{sen}[/red]"
+        else:
+            sen_str = f"[yellow]{sen}[/yellow]"
+
         table.add_row(
             str(i),
-            f"[{colour}]{job.score}[/{colour}]",
+            score_str,
+            sen_str,
             escape(job.title),
             escape(job.company),
-            escape(job.location or "—"),
-            escape(job.source),
+            escape(job.location),
         )
 
     console.print(table)
-    console.print()
 
-    # URL list for copy-paste
-    console.print("[bold]Job URLs:[/bold]")
-    for i, job in enumerate(qualifying, 1):
-        console.print(f"  [{i}] {escape(job.url)}")
-    console.print()
+    # URL list
+    console.print("\n[bold]Job URLs:[/bold]")
+    for i, job in enumerate(jobs, 1):
+        console.print(f"  {i}. [link={job.url}]{escape(job.url)}[/link]")
 
-
-def render_score_detail(job: Job) -> None:
-    """Print score breakdown for a single job (for debugging)."""
-    rprint(f"\n[bold]{escape(job.title)}[/bold] @ [cyan]{escape(job.company)}[/cyan]")
-    rprint(f"  Total score: [bold]{job.score}[/bold]")
-    for k, v in job.score_detail.items():
-        if k == "total":
-            continue
-        sign = "+" if v > 0 else ""
-        colour = "green" if v > 0 else "red"
-        rprint(f"  [{colour}]{sign}{v}[/{colour}]  {k}")
-
-
-def render_summary(
-    raw: int,
-    after_dedup: int,
-    after_gate: int,
-    qualifying: int,
-    zero_sources: list[str],
-    elapsed: float,
-) -> None:
-    """Print run summary stats."""
-    console.print(
-        f"[dim]Raw fetched:[/dim] {raw}  "
-        f"[dim]After dedup:[/dim] {after_dedup}  "
-        f"[dim]After gate:[/dim] {after_gate}  "
-        f"[bold]Qualifying (>= min_score):[/bold] {qualifying}  "
-        f"[dim]Elapsed:[/dim] {elapsed:.1f}s"
-    )
-    if zero_sources:
-        console.print(f"[dim]Zero-result sources:[/dim] {', '.join(zero_sources)}")
+    # Score breakdown
+    console.print("\n[bold]Score Breakdown:[/bold]")
+    for i, job in enumerate(jobs, 1):
+        if job.score_detail:
+            parts = ", ".join(f"{k}={v:+d}" for k, v in job.score_detail.items())
+            console.print(f"  {i}. {escape(job.title[:50])}: {parts}")

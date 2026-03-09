@@ -1,4 +1,4 @@
-"""Shared data model for AeroScout."""
+"""Job data model."""
 from __future__ import annotations
 
 import hashlib
@@ -15,10 +15,10 @@ class Job:
     source: str = ""
     score: int = 0
     score_detail: dict = field(default_factory=dict)
+    seniority: str = ""
     uid: str = field(init=False)
 
     def __post_init__(self) -> None:
-        # Import here to avoid circular; normalise is a leaf module
         from core.normalise import _norm
         self.uid = hashlib.md5(
             f"{_norm(self.title).lower()[:40]}|{self.company.lower()[:20]}".encode()

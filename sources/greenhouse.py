@@ -1,104 +1,74 @@
-"""Greenhouse ATS source.
-
-Endpoint: GET https://boards-api.greenhouse.io/v1/boards/{token}/jobs?content=true
-Response: {"jobs": [...], "meta": {...}}
-"""
+"""Greenhouse ATS fetcher."""
 from __future__ import annotations
 
 import asyncio
+import html as _h
 import logging
 
-import aiohttp
+from bs4 import BeautifulSoup as _BS
 
+from core.gate import passes_gate
 from core.models import Job
-from core.normalise import _norm, _valid_url
-from sources._http import HEADERS_JSON, TASK_TIMEOUT, _SSL, get_semaphore, make_timeout
+from core.normalise import _is_nl, _norm, _valid_url
+from sources._http import HEADERS_JSON, get_sem, safe_get
 
 log = logging.getLogger(__name__)
 
-# (token, display_name) — verified live from research
-TARGETS = [
-    ("databricks",          "Databricks"),
-    ("catawiki",            "Catawiki"),
-    ("sendcloud",           "Sendcloud"),
-    ("elastic",             "Elastic"),
-    ("realtimeboardglobal", "Miro"),       # former name: RealtimeBoard
-    ("flyr",                "FLYR Labs"),  # NOT "flyrlabs" — confirmed correct
+BOARDS = [
+    ("bookingcom", "Booking.com"), ("travix", "Travix"), ("flyrlabs", "FLYR Labs"),
+    ("tomtom", "TomTom"), ("palantir", "Palantir"),
+    ("databricks", "Databricks"), ("aviobook", "Aviobook"), ("snowflakecareers", "Snowflake"),
+    ("spotify", "Spotify Amsterdam"), ("elastic", "Elastic"), ("miro", "Miro"),
+    ("uber", "Uber Amsterdam"), ("atlassian", "Atlassian"), ("kiwi", "Kiwi.com"),
+    ("cirium", "Cirium"), ("netflix", "Netflix"), ("catawiki", "Catawiki"),
+    ("sendcloud", "Sendcloud"), ("travelperk", "TravelPerk"), ("picnic", "Picnic"),
 ]
 
-BASE = "https://boards-api.greenhouse.io/v1/boards"
-HOST = "boards-api.greenhouse.io"
 
+async def _fetch_board(session, token: str, company: str) -> list[Job]:
+    url = f"https://boards-api.greenhouse.io/v1/boards/{token}/jobs?content=true"
+    sem = get_sem("boards-api.greenhouse.io")
+    status, data = await safe_get(session, url, sem, headers=HEADERS_JSON)
 
-async def _fetch_board(
-    session: aiohttp.ClientSession,
-    token: str,
-    company: str,
-) -> list[Job]:
-    """Fetch all jobs for one Greenhouse board."""
-    url = f"{BASE}/{token}/jobs?content=true"
-    sem = get_semaphore(HOST)
+    if status == 404:
+        log.debug("Greenhouse %s: 404", token)
+        return []
+    if status != 200 or not isinstance(data, dict):
+        log.debug("Greenhouse %s: status=%s", token, status)
+        return []
 
-    async with sem:
-        try:
-            async with session.get(
-                url,
-                headers=HEADERS_JSON,
-                ssl=_SSL,
-                timeout=make_timeout(),
-            ) as resp:
-                if resp.status == 404:
-                    log.debug("Greenhouse token '%s' → 404 (dead)", token)
-                    return []
-                if resp.status != 200:
-                    log.warning("Greenhouse '%s' → HTTP %s", token, resp.status)
-                    return []
-                data = await resp.json(content_type=None)
-        except Exception as exc:
-            log.warning("Greenhouse '%s' error: %s", token, exc)
-            return []
+    jobs: list[Job] = []
+    for j in data.get("jobs", []):
+        title = j.get("title", "")
+        loc = j.get("location", {}).get("name", "")
+        job_url = j.get("absolute_url", "")
+        raw = _h.unescape(j.get("content", "") or "")
+        desc = _BS(raw, "lxml").get_text(" ", strip=True) if raw else ""
 
-    jobs = []
-    for item in data.get("jobs", []):
-        title = _norm(item.get("title", ""))
-        if not title:
+        if loc and not _is_nl(loc):
             continue
-        job_url = item.get("absolute_url", "")
         if not _valid_url(job_url):
             continue
 
-        loc = item.get("location", {})
-        location = loc.get("name", "") if isinstance(loc, dict) else str(loc)
-
-        # content is HTML job description
-        description = item.get("content", "") or ""
+        ok, _ = passes_gate(_norm(title), company=company)
+        if not ok:
+            continue
 
         jobs.append(Job(
-            title=title,
-            company=company,
-            location=location,
-            url=job_url,
-            description=description[:3000],
-            source="greenhouse",
+            title=title, company=company, location=loc,
+            url=job_url, description=desc, source="greenhouse",
         ))
 
-    log.debug("Greenhouse '%s': %d jobs", token, len(jobs))
     return jobs
 
 
-async def fetch_greenhouse(session: aiohttp.ClientSession) -> list[Job]:
-    tasks = [
-        asyncio.wait_for(_fetch_board(session, token, company), timeout=TASK_TIMEOUT)
-        for token, company in TARGETS
-    ]
+async def fetch_greenhouse(session) -> list[Job]:
+    tasks = [_fetch_board(session, t, c) for t, c in BOARDS]
     results = await asyncio.gather(*tasks, return_exceptions=True)
-
     jobs: list[Job] = []
     for r in results:
-        if isinstance(r, BaseException):
-            log.warning("Greenhouse task exception: %s", r)
-            continue
-        jobs.extend(r)
-
-    log.debug("Greenhouse total: %d jobs", len(jobs))
+        if isinstance(r, list):
+            jobs.extend(r)
+        elif isinstance(r, Exception):
+            log.warning("Greenhouse error: %s", r)
     return jobs

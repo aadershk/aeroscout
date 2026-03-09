@@ -1,152 +1,95 @@
-"""Workday ATS source.
-
-Endpoint: POST https://{tenant}.wd3.myworkdayjobs.com/wday/cxs/{tenant}/{site}/jobs
-Response: {"jobPostings": [...]}  — each item has externalPath starting with "/"
-Full job URL: f"{base_root}{ext}"  where base_root = https://{tenant}.wd3.myworkdayjobs.com
-"""
+"""Workday ATS fetcher."""
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
 
-import aiohttp
-
+from core.gate import passes_gate
 from core.models import Job
-from core.normalise import _norm, _valid_url
-from sources._http import HEADERS_JSON, TASK_TIMEOUT, _SSL, get_semaphore, make_timeout
+from core.normalise import _is_nl, _norm, _valid_url
+from sources._http import HEADERS_JSON, get_sem, safe_post
 
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Confirmed tenants (from research report)
-# ---------------------------------------------------------------------------
 TARGETS = [
-    # (tenant, site, company_display_name)
-    ("amadeus",     "jobs",                       "Amadeus"),
-    ("accenture",   "AccentureCareers",            "Accenture"),
-    ("ing",         "ICSNLDGEN",                   "ING"),          # NL-specific
-    ("philips",     "jobs-and-careers",            "Philips"),
-    ("shell",       "ShellCareers",                "Shell"),
-    ("vanderlande", "careers",                     "Vanderlande"),
-    ("wk",          "External",                    "Wolters Kluwer"),
-    ("nxp",         "careers",                     "NXP Semiconductors"),
-    ("maersk",      "PT_Careers",                  "Maersk"),
-    ("relx",        "ciriumcareers",               "Cirium"),
-    ("pwc",         "Global_Campus_Careers",       "PwC"),
-    ("pwc",         "Global_Experienced_Careers",  "PwC"),
+    ("klm", "KLMCareers", "KLM"),
+    ("amadeus", "jobs", "Amadeus"),
+    ("accenture", "AccentureCareers", "Accenture"),
+    ("ing", "ICSNLDGEN", "ING"),
+    ("philips", "jobs-and-careers", "Philips"),
+    ("shell", "ShellCareers", "Shell"),
+    ("vanderlande", "careers", "Vanderlande"),
+    ("wk", "External", "Wolters Kluwer"),
+    ("nxp", "careers", "NXP Semiconductors"),
+    ("maersk", "PT_Careers", "Maersk"),
+    ("relx", "ciriumcareers", "Cirium"),
+    ("pwc", "Global_Campus_Careers", "PwC"),
+    ("pwc", "Global_Experienced_Careers", "PwC"),
+    ("capgemini", "CapgeminiCareers", "Capgemini"),
+    ("asml", "ASMLCareers", "ASML"),
+    ("heineken", "Heineken_Careers", "Heineken"),
+    ("adyen", "Adyen_Careers", "Adyen"),
+    ("dhl", "DHLGroupCareers", "DHL"),
+    ("postnl", "PostNL_Careers", "PostNL"),
 ]
 
-# Search terms — multiple passes to catch different role types
 SEARCH_TERMS = [
-    "data analyst",
-    "data scientist",
-    "revenue management",
-    "operations research",
-    "analytics",
+    "revenue management", "operations research", "pricing analyst", "data scientist",
+    "data analyst", "analytics engineer", "machine learning", "yield analyst",
+    "quantitative analyst", "business intelligence", "demand forecasting",
+    "mro analytics", "network planning", "transport analytics", "supply chain analytics",
+    "business analyst",
 ]
 
-PAGE_SIZE = 20
 
-
-async def _fetch_tenant(
-    session: aiohttp.ClientSession,
-    tenant: str,
-    site: str,
-    company: str,
-    search: str,
-) -> list[dict[str, Any]]:
-    """Fetch one page of results for one tenant+search combination."""
-    base_root = f"https://{tenant}.wd3.myworkdayjobs.com"
-    api_url = f"{base_root}/wday/cxs/{tenant}/{site}/jobs"
-    host = f"{tenant}.wd3.myworkdayjobs.com"
-    sem = get_semaphore(host)
-
-    payload = {"limit": PAGE_SIZE, "offset": 0, "searchText": search, "appliedFacets": {}}
-
-    async with sem:
-        try:
-            async with session.post(
-                api_url,
-                json=payload,
-                headers=HEADERS_JSON,
-                ssl=_SSL,
-                timeout=make_timeout(),
-            ) as resp:
-                if resp.status != 200:
-                    log.debug("%s/%s [%s] → HTTP %s", tenant, site, search, resp.status)
-                    return []
-                data = await resp.json(content_type=None)
-                postings = data.get("jobPostings", [])
-                # Attach base_root so caller can build full URL
-                for p in postings:
-                    p["_base_root"] = base_root
-                    p["_company"] = company
-                return postings
-        except Exception as exc:
-            log.warning("Workday %s/%s [%s] error: %s", tenant, site, search, exc)
-            return []
-
-
-def _posting_to_job(p: dict[str, Any]) -> Job | None:
-    """Convert a Workday posting dict to a Job."""
-    ext = p.get("externalPath", "")
-    if not ext.startswith("/"):
-        return None
-    base_root = p.get("_base_root", "")
-    url = f"{base_root}{ext}"
-    if not _valid_url(url):
-        return None
-
-    title = _norm(p.get("title", ""))
-    if not title:
-        return None
-
-    location_data = p.get("locationsText", "") or p.get("primaryLocation", {})
-    if isinstance(location_data, dict):
-        location = location_data.get("name", "")
-    else:
-        location = str(location_data)
-
-    return Job(
-        title=title,
-        company=p.get("_company", ""),
-        location=location,
-        url=url,
-        source="workday",
-    )
-
-
-async def fetch_workday(
-    session: aiohttp.ClientSession,
-) -> list[Job]:
-    """Fetch all Workday targets across all search terms."""
-    tasks = []
-    for tenant, site, company in TARGETS:
-        for search in SEARCH_TERMS:
-            tasks.append(
-                asyncio.wait_for(
-                    _fetch_tenant(session, tenant, site, company, search),
-                    timeout=TASK_TIMEOUT,
-                )
-            )
-
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
+async def _fetch_tenant(session, tenant: str, site: str, company: str) -> list[Job]:
+    """Fetch jobs from a single Workday tenant."""
+    base_url = f"https://{tenant}.wd3.myworkdayjobs.com"
+    api_url = f"{base_url}/wday/cxs/{tenant}/{site}/jobs"
+    sem = get_sem(f"{tenant}.wd3.myworkdayjobs.com")
     jobs: list[Job] = []
-    seen_ext: set[str] = set()  # deduplicate within workday before returning
-    for batch in results:
-        if isinstance(batch, BaseException):
-            log.warning("Workday task exception: %s", batch)
-            continue
-        for p in batch:
-            ext = p.get("externalPath", "")
-            if ext in seen_ext:
-                continue
-            seen_ext.add(ext)
-            job = _posting_to_job(p)
-            if job:
-                jobs.append(job)
+    seen_urls: set[str] = set()
 
-    log.debug("Workday: %d raw jobs", len(jobs))
+    for term in SEARCH_TERMS:
+        payload = {"limit": 20, "offset": 0, "searchText": term, "appliedFacets": {}}
+        status, data = await safe_post(session, api_url, sem, payload, HEADERS_JSON)
+        if status != 200 or not isinstance(data, dict):
+            log.debug("Workday %s/%s term=%s status=%s", tenant, site, term, status)
+            continue
+
+        for posting in data.get("jobPostings", []):
+            title = posting.get("title", "")
+            ext = posting.get("externalPath", "")
+            loc = posting.get("locationsText", "")
+
+            if loc and not _is_nl(loc):
+                continue
+
+            url = f"{base_url}{ext}"
+            if not _valid_url(url) or url in seen_urls:
+                continue
+            seen_urls.add(url)
+
+            ok, _ = passes_gate(_norm(title), company=company)
+            if not ok:
+                continue
+
+            jobs.append(Job(
+                title=title, company=company, location=loc,
+                url=url, source="workday",
+            ))
+
+    return jobs
+
+
+async def fetch_workday(session) -> list[Job]:
+    """Fetch from all Workday tenants."""
+    tasks = [_fetch_tenant(session, t, s, c) for t, s, c in TARGETS]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    jobs: list[Job] = []
+    for r in results:
+        if isinstance(r, list):
+            jobs.extend(r)
+        elif isinstance(r, Exception):
+            log.warning("Workday error: %s", r)
     return jobs

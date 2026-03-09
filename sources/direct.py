@@ -1,129 +1,128 @@
-"""Direct company career page scraper.
-
-For companies not on a supported ATS. Fetches JSON-LD job postings from
-career pages when available. Falls back to parsing <a> tags for job links.
-
-Currently targets companies where ATS was unverified in research.
-"""
+"""Direct career page scraper — JSON-LD only."""
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-import re
 
 from bs4 import BeautifulSoup
-import aiohttp
 
+from bs4 import BeautifulSoup as _BS
+
+from core.gate import passes_gate
 from core.models import Job
 from core.normalise import _norm, _valid_url
-from sources._http import HEADERS_BROWSER, TASK_TIMEOUT, _SSL, get_semaphore, make_timeout
+from sources._http import HEADERS_HTML, get_sem, safe_get
 
 log = logging.getLogger(__name__)
 
-# (company_name, careers_url)
-# Only include pages that are known to have job listings (not login-gated)
 TARGETS = [
-    ("To70",              "https://to70.com/about/careers/"),
+    ("To70", "https://to70.com/about/careers/"),
     ("Seabury Consulting", "https://seaburyconsulting.com/careers/"),
-    ("NACO",              "https://www.naco.nl/careers"),
-    ("Aevean",            "https://aevean.com/careers"),
-    ("IBS Software",      "https://www.ibsplc.com/careers"),
-    ("NAVBLUE",           "https://www.navblue.aero/en/careers"),
+    ("EASA", "https://www.easa.europa.eu/en/the-agency/working-easa/vacancies"),
+    ("OAG", "https://www.oag.com/about/careers"),
     ("Lufthansa Systems", "https://careers.lhsystems.com/"),
+    ("AerCap", "https://www.aercap.com/careers"),
+    ("Fokker Services", "https://www.fokker.com/en/careers"),
+    ("Port of Amsterdam", "https://www.portofamsterdam.com/en/working-at/vacancies"),
+    ("NS", "https://werkenbijns.nl/vacatures"),
+    ("LVNL", "https://www.lvnl.nl/werken-bij"),
+    ("NLR", "https://www.nlr.org/career/vacancies/"),
+    ("KLM", "https://careers.klm.com/nl/jobs/"),
 ]
 
-_JSONLD_TYPE = re.compile(r'"@type"\s*:\s*"JobPosting"', re.I)
 
+async def _fetch_site(session, company: str, page_url: str) -> list[Job]:
+    from urllib.parse import urlparse
+    host = urlparse(page_url).hostname or ""
+    sem = get_sem(host)
 
-def _extract_jsonld_jobs(html: str, company: str, base_url: str) -> list[Job]:
-    """Extract jobs from JSON-LD JobPosting schema blocks."""
-    soup = BeautifulSoup(html, "lxml")
-    jobs = []
-    for tag in soup.find_all("script", type="application/ld+json"):
+    status, text = await safe_get(session, page_url, sem, headers=HEADERS_HTML)
+    if status != 200 or not text or not isinstance(text, str):
+        log.debug("Direct %s: status=%s", company, status)
+        return []
+
+    soup = BeautifulSoup(text, "lxml")
+    jobs: list[Job] = []
+
+    for script in soup.find_all("script", type="application/ld+json"):
         try:
-            data = json.loads(tag.string or "")
-        except (json.JSONDecodeError, TypeError):
+            ld = json.loads(script.string or "")
+        except (json.JSONDecodeError, AttributeError):
             continue
 
-        # Handle single object or @graph array
-        items = data if isinstance(data, list) else [data]
-        for item in items:
-            if item.get("@type") != "JobPosting":
+        # Handle various JSON-LD structures
+        postings: list[dict] = []
+        if isinstance(ld, list):
+            postings = ld
+        elif isinstance(ld, dict):
+            if ld.get("@type") == "JobPosting":
+                postings = [ld]
+            elif "itemListElement" in ld:
+                for item in ld["itemListElement"]:
+                    if isinstance(item, dict):
+                        postings.append(item.get("item", item))
+            elif "@graph" in ld:
+                for item in ld["@graph"]:
+                    if isinstance(item, dict) and item.get("@type") == "JobPosting":
+                        postings.append(item)
+
+        for posting in postings:
+            if not isinstance(posting, dict):
                 continue
-            title = _norm(item.get("title", ""))
+            if posting.get("@type") not in ("JobPosting", None):
+                continue
+
+            title = posting.get("title", posting.get("name", ""))
             if not title:
                 continue
-            job_url = item.get("url", "") or base_url
+
+            job_url = posting.get("url", "")
+            raw_desc = posting.get("description", "")
+            desc = _BS(raw_desc, "lxml").get_text(" ", strip=True) if raw_desc and "<" in str(raw_desc) else str(raw_desc)
+
+            ho = posting.get("hiringOrganization", {})
+            co = ho.get("name", "") if isinstance(ho, dict) else ""
+            if not co:
+                co = company
+
+            loc_obj = posting.get("jobLocation", {})
+            loc = ""
+            if isinstance(loc_obj, dict):
+                addr = loc_obj.get("address", {})
+                if isinstance(addr, dict):
+                    loc = addr.get("addressLocality", addr.get("name", ""))
+                elif isinstance(addr, str):
+                    loc = addr
+            elif isinstance(loc_obj, list) and loc_obj:
+                addr = loc_obj[0].get("address", {})
+                if isinstance(addr, dict):
+                    loc = addr.get("addressLocality", "")
+
             if not _valid_url(job_url):
                 continue
-            loc = item.get("jobLocation", {})
-            if isinstance(loc, dict):
-                addr = loc.get("address", {})
-                location = addr.get("addressLocality", "") if isinstance(addr, dict) else ""
-            else:
-                location = ""
-            description = item.get("description", "") or ""
+
+            ok, _ = passes_gate(_norm(title), company=co)
+            if not ok:
+                continue
+
             jobs.append(Job(
-                title=title,
-                company=company,
-                location=location,
-                url=job_url,
-                description=description[:3000],
-                source="direct",
+                title=title, company=co, location=loc,
+                url=job_url, description=desc, source="direct",
             ))
+
+    if not jobs:
+        log.debug("Direct %s: no JSON-LD found", company)
     return jobs
 
 
-async def _fetch_page(
-    session: aiohttp.ClientSession,
-    company: str,
-    url: str,
-) -> list[Job]:
-    from urllib.parse import urlparse
-    host = urlparse(url).netloc
-    sem = get_semaphore(host)
-
-    async with sem:
-        try:
-            async with session.get(
-                url,
-                headers=HEADERS_BROWSER,
-                ssl=_SSL,
-                timeout=make_timeout(),
-            ) as resp:
-                if resp.status != 200:
-                    log.debug("Direct '%s' → HTTP %s", company, resp.status)
-                    return []
-                html = await resp.text()
-        except Exception as exc:
-            log.warning("Direct '%s' error: %s", company, exc)
-            return []
-
-    # Try JSON-LD first (structured data)
-    if _JSONLD_TYPE.search(html):
-        jobs = _extract_jsonld_jobs(html, company, url)
-        if jobs:
-            log.debug("Direct '%s': %d jobs via JSON-LD", company, len(jobs))
-            return jobs
-
-    log.debug("Direct '%s': no JSON-LD jobs found on %s", company, url)
-    return []
-
-
-async def fetch_direct(session: aiohttp.ClientSession) -> list[Job]:
-    tasks = [
-        asyncio.wait_for(_fetch_page(session, company, url), timeout=TASK_TIMEOUT)
-        for company, url in TARGETS
-    ]
+async def fetch_direct(session) -> list[Job]:
+    tasks = [_fetch_site(session, c, u) for c, u in TARGETS]
     results = await asyncio.gather(*tasks, return_exceptions=True)
-
     jobs: list[Job] = []
     for r in results:
-        if isinstance(r, BaseException):
-            log.warning("Direct task exception: %s", r)
-            continue
-        jobs.extend(r)
-
-    log.debug("Direct total: %d jobs", len(jobs))
+        if isinstance(r, list):
+            jobs.extend(r)
+        elif isinstance(r, Exception):
+            log.warning("Direct error: %s", r)
     return jobs
